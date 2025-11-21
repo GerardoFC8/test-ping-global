@@ -75,29 +75,109 @@ export default function Home() {
     setSelectedServerId(server.id)
   }, [])
 
+  // Measure HTTP ping directly from client (browser) to use user's IP
+  const measureHTTPFromClient = useCallback(async (endpoint: string): Promise<number> => {
+    const measurements: number[] = []
+    const numMeasurements = 3
+    const timeout = 10000 // 10 seconds
+
+    for (let i = 0; i < numMeasurements; i++) {
+      try {
+        const startTime = Date.now()
+        
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+        let response: Response | null = null
+        try {
+          // Try with HEAD request first
+          response = await fetch(endpoint, {
+            method: "HEAD",
+            signal: controller.signal,
+            cache: "no-store",
+          })
+        } catch (fetchError) {
+          // If HEAD fails (CORS), try GET request
+          try {
+            response = await fetch(endpoint, {
+              method: "GET",
+              signal: controller.signal,
+              cache: "no-store",
+            })
+          } catch (getError) {
+            // If both fail, use elapsed time
+            const endTime = Date.now()
+            const elapsed = endTime - startTime
+            measurements.push(elapsed < timeout ? elapsed : timeout)
+            clearTimeout(timeoutId)
+            continue
+          }
+        }
+
+        clearTimeout(timeoutId)
+
+        if (response && !response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const endTime = Date.now()
+        const latency = endTime - startTime
+        measurements.push(latency)
+
+        // Small delay between measurements
+        if (i < numMeasurements - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          measurements.push(timeout)
+        } else {
+          console.error(`HTTP measurement ${i + 1} failed:`, error)
+          // Use timeout value if measurement fails
+          measurements.push(timeout)
+        }
+      }
+    }
+
+    if (measurements.length === 0) {
+      throw new Error("All HTTP measurements failed")
+    }
+
+    const avg = measurements.reduce((a, b) => a + b, 0) / measurements.length
+    return Math.round(avg)
+  }, [])
+
   const handleTestPing = useCallback(async (server: Server) => {
     setPingLoadingStates((prev) => ({ ...prev, [server.id]: true }))
     setSelectedServerId(server.id)
 
     try {
-      const response = await fetch("/api/ping", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          endpoint: server.endpoint,
-          type: pingType,
-          hostname: server.hostname,
-        }),
-      })
+      let latency: number
 
-      if (!response.ok) {
-        throw new Error("Failed to measure ping")
+      // For HTTP ping, measure directly from client (browser) to use user's IP
+      if (pingType === "http") {
+        latency = await measureHTTPFromClient(server.endpoint)
+      } else {
+        // For ICMP ping, use server API (browser cannot execute ping commands)
+        const response = await fetch("/api/ping", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            endpoint: server.endpoint,
+            type: pingType,
+            hostname: server.hostname,
+          }),
+        })
+
+        if (!response.ok) {
+          throw new Error("Failed to measure ping")
+        }
+
+        const data = await response.json()
+        latency = data.latency
       }
-
-      const data = await response.json()
-      const latency = data.latency
       
       // Update state
       setPingResults((prev) => ({
@@ -121,7 +201,7 @@ export default function Home() {
     } finally {
       setPingLoadingStates((prev) => ({ ...prev, [server.id]: false }))
     }
-  }, [pingType])
+  }, [pingType, measureHTTPFromClient])
 
   return (
     <div className="min-h-screen bg-background">
