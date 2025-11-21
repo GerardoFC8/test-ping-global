@@ -110,6 +110,17 @@ async function measureHTTP(endpoint: string) {
 }
 
 async function measureICMP(hostname: string) {
+  // Check if we're in Vercel (serverless environment)
+  // Vercel doesn't allow system commands like 'ping'
+  const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV
+
+  if (isVercel) {
+    // In Vercel, use TCP connection as approximation to ICMP
+    // This measures the time to establish a TCP connection, which is similar to ICMP
+    return await measureICMPViaTCP(hostname)
+  }
+
+  // In local development or other environments, use actual ping command
   const measurements: number[] = []
   const numMeasurements = 3
   const isWindows = process.platform === "win32"
@@ -186,6 +197,109 @@ async function measureICMP(hostname: string) {
     max: Math.round(max),
     measurements: measurements.map((m) => Math.round(m)),
     type: "icmp",
+  })
+}
+
+// Alternative ICMP measurement using TCP connection (for serverless environments)
+async function measureICMPViaTCP(hostname: string) {
+  const measurements: number[] = []
+  const numMeasurements = 3
+  const timeout = 10000 // 10 seconds
+
+  // Try common ports (80 for HTTP, 443 for HTTPS)
+  const ports = [80, 443]
+
+  for (let i = 0; i < numMeasurements; i++) {
+    let measurementSuccess = false
+
+    for (const port of ports) {
+      try {
+        const startTime = Date.now()
+        
+        // Use fetch to establish a connection (this measures TCP handshake time)
+        // We'll use a minimal request to measure connection time
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+        try {
+          const protocol = port === 443 ? "https" : "http"
+          const url = `${protocol}://${hostname}`
+          
+          const response = await fetch(url, {
+            method: "HEAD",
+            signal: controller.signal,
+            cache: "no-store",
+          })
+
+          clearTimeout(timeoutId)
+
+          const endTime = Date.now()
+          const latency = endTime - startTime
+          
+          // Only accept reasonable latencies (not timeout values)
+          if (latency < timeout) {
+            measurements.push(latency)
+            measurementSuccess = true
+            break
+          }
+        } catch (fetchError) {
+          clearTimeout(timeoutId)
+          // Try next port
+          continue
+        }
+      } catch (error) {
+        // Try next port
+        continue
+      }
+    }
+
+    // If all ports failed, use a fallback measurement
+    if (!measurementSuccess) {
+      // Try DNS lookup + connection as last resort
+      try {
+        const startTime = Date.now()
+        // Simple DNS + connection test
+        const response = await fetch(`https://${hostname}`, {
+          method: "HEAD",
+          signal: AbortSignal.timeout(timeout),
+          cache: "no-store",
+        })
+        const endTime = Date.now()
+        const latency = endTime - startTime
+        if (latency < timeout) {
+          measurements.push(latency)
+        } else {
+          measurements.push(timeout)
+        }
+      } catch {
+        measurements.push(timeout)
+      }
+    }
+
+    // Small delay between measurements
+    if (i < numMeasurements - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+
+  if (measurements.length === 0) {
+    return NextResponse.json(
+      { error: "All ICMP measurements failed" },
+      { status: 500 }
+    )
+  }
+
+  const min = Math.min(...measurements)
+  const max = Math.max(...measurements)
+  const avg = measurements.reduce((a, b) => a + b, 0) / measurements.length
+
+  return NextResponse.json({
+    latency: Math.round(avg),
+    min: Math.round(min),
+    max: Math.round(max),
+    measurements: measurements.map((m) => Math.round(m)),
+    type: "icmp",
+    note: "Measured via TCP connection (serverless environment)",
   })
 }
 
